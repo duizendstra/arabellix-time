@@ -3,6 +3,13 @@
  * @description Provides the primary UI for creating new calendar events. 
  * Allows the user to select date, client, project, task, and then create an event.
  * If the app is not initialized, redirects the user to the AdminCard.
+ *
+ * Behavior:
+ * - Always show a dropdown for projects (even if one or multiple projects).
+ * - Always show radio buttons for tasks (even if one or multiple tasks).
+ * - The first project is always selected by default if multiple projects are available or if it's not set.
+ * - The first task is always selected by default if multiple tasks are available or if it's not set.
+ * - This logic also applies if the client or project changes, ensuring defaults are reapplied.
  */
 
 /* global gasConfigManager, gasProjectInfoManager, gasBigQueryManager, gasCalendarManager, CardService, console, AdminCard */
@@ -17,7 +24,7 @@ const HomepageCard = (options = {}) => {
 
   const { event: actionEvent, code: paramCode = "", rate: paramRate = "" } = parameters;
 
-  // Initialize configuration and check if the app is ready
+  // Initialize configuration and check if app is ready
   const configManager = gasConfigManager();
   if (!configManager.isInitialized()) {
     console.log("App not initialized. Redirecting to AdminCard.");
@@ -70,7 +77,6 @@ const HomepageCard = (options = {}) => {
       const comments = taskDetails.comments || "";
       const categoriesArray = taskDetails.categories ? [taskDetails.categories] : [];
 
-      // Pass eventDescription into description
       const newEventId = calendarManager.createEvent({
         title: eventTitle || "Untitled Event",
         startTime: roundedStart,
@@ -100,7 +106,6 @@ const HomepageCard = (options = {}) => {
     }
   };
 
-  // Handle input changes by updating the card in place
   const handleInputChange = () => {
     return CardService.newActionResponseBuilder()
       .setNavigation(
@@ -111,6 +116,11 @@ const HomepageCard = (options = {}) => {
 
   /** ------------------- UI Builder Functions ------------------- **/
   const buildUiCard = () => {
+    // Reapply default selections if needed
+    // This ensures that when the card is rebuilt (e.g. after client/project change),
+    // we always have the first project and first task selected if needed.
+    applyDefaultSelections();
+
     const card = CardService.newCardBuilder()
       .setHeader(
         CardService.newCardHeader()
@@ -132,6 +142,41 @@ const HomepageCard = (options = {}) => {
     return card.build();
   };
 
+  /**
+   * Ensures that if multiple projects exist and no project is selected, we pick the first one.
+   * Similarly, if multiple tasks exist and no task is selected, we pick the first one.
+   */
+  const applyDefaultSelections = () => {
+    const clientItems = projectInfoManager.getActiveClients();
+    if (clientItems.length > 0 && !client) {
+      client = clientItems[0];
+    }
+
+    if (client) {
+      const selectedClient = nestedItems[client] || {};
+      const projects = Object.keys(selectedClient);
+      if (projects.length > 0) {
+        // If no project selected or it doesn't exist, select first
+        if (!project || !projects.includes(project)) {
+          project = projects[0];
+        }
+
+        const tasks = selectedClient[project] || [];
+        if (tasks.length > 0) {
+          // If no task selected or it doesn't exist, select first
+          if (!task || !tasks.find(t => t.task === task)) {
+            task = tasks[0].task;
+          }
+          // Update taskDetails if a task is selected
+          const selectedTask = tasks.find(t => t.task === task);
+          if (selectedTask) {
+            taskDetails = selectedTask;
+          }
+        }
+      }
+    }
+  };
+
   const buildEventBasicsSection = () => {
     const section = CardService.newCardSection().setHeader('Event Basics');
 
@@ -148,9 +193,6 @@ const HomepageCard = (options = {}) => {
     section.addWidget(descriptionInput);
 
     const clientItems = projectInfoManager.getActiveClients();
-    if (clientItems.length > 0 && !client) {
-      client = clientItems[0];
-    }
 
     const clientInput = CardService.newSelectionInput()
       .setType(CardService.SelectionInputType.DROPDOWN)
@@ -183,64 +225,10 @@ const HomepageCard = (options = {}) => {
       const selectedClient = nestedItems[client] || {};
       const projects = Object.keys(selectedClient);
 
-      // If there's only one project, select it automatically and don't show multiple choice
-      if (projects.length === 1) {
-        project = project || projects[0];
-        section.addWidget(
-          CardService.newDecoratedText()
-            .setTopLabel('Project')
-            .setText(project)
-        );
-
-        const tasks = selectedClient[project] || [];
-
-        // If there's only one task, select it automatically and display it
-        if (tasks.length === 1) {
-          const singleTask = tasks[0];
-          task = task || singleTask.task;
-          taskDetails = singleTask;
-          section.addWidget(
-            CardService.newDecoratedText()
-              .setTopLabel('Task')
-              .setText(singleTask.task)
-          );
-        } else if (tasks.length > 1) {
-          // Multiple tasks available, let the user select
-          if (task && !tasks.find(t => t.task === task)) {
-            task = null;
-          }
-
-          const taskInput = CardService.newSelectionInput()
-            .setType(CardService.SelectionInputType.RADIO_BUTTON)
-            .setTitle('Task')
-            .setFieldName('Task')
-            .setOnChangeAction(
-              CardService.newAction()
-                .setFunctionName('HomepageCard')
-                .setParameters({ event: "inputChangeTask" })
-            );
-
-          tasks.forEach((t) => {
-            taskInput.addItem(t.task, t.task, t.task === task);
-          });
-          section.addWidget(taskInput);
-
-          // If a task is selected, update taskDetails
-          if (task) {
-            const selectedTask = tasks.find(t => t.task === task);
-            if (selectedTask) {
-              taskDetails = selectedTask;
-            }
-          }
-        } else {
-          section.addWidget(CardService.newTextParagraph().setText("No tasks found for this project."));
-        }
-      } else if (projects.length > 1) {
-        // Multiple projects
-        project = project || projects[0];
-
+      if (projects.length > 0) {
+        // Projects dropdown
         const projectInput = CardService.newSelectionInput()
-          .setType(CardService.SelectionInputType.RADIO_BUTTON)
+          .setType(CardService.SelectionInputType.DROPDOWN)
           .setTitle('Project')
           .setFieldName('Project')
           .setOnChangeAction(
@@ -256,45 +244,22 @@ const HomepageCard = (options = {}) => {
 
         const tasks = selectedClient[project] || [];
         if (tasks.length > 0) {
-          if (task && !tasks.find(t => t.task === task)) {
-            task = null;
-          }
-
-          // If there's only one task, select it automatically
-          if (tasks.length === 1) {
-            const singleTask = tasks[0];
-            task = singleTask.task;
-            taskDetails = singleTask;
-
-            section.addWidget(
-              CardService.newDecoratedText()
-                .setTopLabel('Task')
-                .setText(singleTask.task)
+          // Tasks radio buttons
+          const taskInput = CardService.newSelectionInput()
+            .setType(CardService.SelectionInputType.RADIO_BUTTON)
+            .setTitle('Task')
+            .setFieldName('Task')
+            .setOnChangeAction(
+              CardService.newAction()
+                .setFunctionName('HomepageCard')
+                .setParameters({ event: "inputChangeTask" })
             );
-          } else {
-            // Multiple tasks
-            const taskInput = CardService.newSelectionInput()
-              .setType(CardService.SelectionInputType.RADIO_BUTTON)
-              .setTitle('Task')
-              .setFieldName('Task')
-              .setOnChangeAction(
-                CardService.newAction()
-                  .setFunctionName('HomepageCard')
-                  .setParameters({ event: "inputChangeTask" })
-              );
 
-            tasks.forEach((t) => {
-              taskInput.addItem(t.task, t.task, t.task === task);
-            });
-            section.addWidget(taskInput);
+          tasks.forEach((t) => {
+            taskInput.addItem(t.task, t.task, t.task === task);
+          });
+          section.addWidget(taskInput);
 
-            if (task) {
-              const selectedTask = tasks.find(t => t.task === task);
-              if (selectedTask) {
-                taskDetails = selectedTask;
-              }
-            }
-          }
         } else {
           section.addWidget(CardService.newTextParagraph().setText("No tasks found for this project."));
         }
