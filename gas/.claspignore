@@ -1,0 +1,31 @@
+# Ignore all files in the project by default
+**/**
+
+# Whitelist the files and folders you want to include
+!appsscript.json
+!cards/AdminCard.js
+!cards/EventCard.js
+!cards/HomepageCard.js
+!managers/gasBigQueryManager.js
+!managers/gasCalendarManager.js
+!managers/gasConfigManager.js
+!managers/gasProjectInfoManager.js
+!managers/gasSyncManager.js
+!schemas/ProjectSchema.js
+!schemas/TimeSchema.js
+!triggers/sync.js
+
+# Optional: Exclude specific test files or folders
+test/*
+!test.js
+
+# Optional: Exclude specific scratch files
+!scratchpad.js
+!cards/StateCard.js
+
+# Optional: Ignore common system or IDE files
+.DS_Store
+Thumbs.db
+node_modules/
+package.json
+package-lock.json

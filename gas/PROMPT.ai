@@ -1,0 +1,2504 @@
+You are working with Google Apps Script to build a Google Workspace Add-on. Use modern JavaScript (ES6+ features) where possible. You have a pattern for building UI cards and a pattern for building managers.
+
+1. **UI Cards Pattern:**
+   - Reference the `StateCard` code example:
+     ```js
+/* global CacheService, SpreadsheetApp, BigQuery, console */
+
+/**
+ * @file gasProjectInfoManager.js
+ * @description Manages project-related data stored in a Google Sheet and synchronizes it with BigQuery.
+ * This module provides methods for fetching, transforming, and maintaining project information,
+ * ensuring consistency and supporting advanced reporting and querying capabilities.
+ */
+
+/**
+ * The `gasProjectInfoManager` is responsible for managing project-related data stored in a Google Sheet
+ * and syncing it with BigQuery. It provides caching for improved performance and utility methods to transform,
+ * retrieve, and keep project information up-to-date in BigQuery.
+ *
+ * The Google Sheet is expected to have the following header structure:
+ * Code, Client, Project, Task, Default, From, To, Rate, Description, Comments, Company size, Categories.
+ *
+ * - The `Code` uniquely identifies the task with all the associated data.
+ * - The template sheet ID is `15bpKYmmfzFUqsbviv83rvMJGxwGlZD7JQ6tOklymDwQ`.
+ * - Calculated fields `record_date_time` and `modified_time` are added during syncing to BigQuery.
+ *
+ * @param {Object} params - Configuration parameters.
+ * @param {string} params.spreadsheetId - The ID of the Google Spreadsheet.
+ * @param {string} [params.sheetName="Projects"] - The name of the sheet containing project data.
+ * @param {string} [params.cacheKey="projectInfo"] - The key used for caching.
+ * @param {number} [params.cacheExpiry=3600] - Cache expiration time in seconds (default: 1 hour).
+ * @param {Object} params.bigQueryManager - Instance of the BigQuery manager for syncing data.
+ * @returns {Object} - Methods for interacting with project data.
+ */
+const gasProjectInfoManager = (params = {}) => {
+  const {
+    spreadsheetId,
+    sheetName = "Projects",
+    cacheKey = "projectInfo",
+    cacheExpiry = 3600,
+    bigQueryManager
+  } = params;
+
+  if (!spreadsheetId) {
+    throw new Error("spreadsheetId is required");
+  }
+
+  if (!bigQueryManager) {
+    throw new Error("bigQueryManager is required for syncing data to BigQuery");
+  }
+
+  /**
+   * Clears the cache for project data.
+   */
+  const clearCache = () => {
+    const cache = CacheService.getUserCache();
+    cache.remove(cacheKey);
+    console.log('Cache cleared successfully.');
+  };
+
+  /**
+   * Fetches data from the cache.
+   * @returns {Array|null} - Cached data or null if not available.
+   */
+  const fetchFromCache = () => {
+    const cache = CacheService.getUserCache();
+    const cachedData = cache.get(cacheKey);
+    return cachedData ? JSON.parse(cachedData) : null;
+  };
+
+  /**
+   * Fetches data from the Google Sheet.
+   * @returns {Array} - Data from the sheet excluding the header row.
+   */
+  const fetchFromSpreadsheet = () => {
+    const spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+    const sheet = spreadsheet.getSheetByName(sheetName);
+    const dataRange = sheet.getDataRange();
+    return dataRange.getValues().slice(1); // Exclude header row
+  };
+
+  /**
+   * Caches the provided data.
+   * @param {Array} data - The data to cache.
+   */
+  const cacheData = (data) => {
+    const cache = CacheService.getUserCache();
+    cache.put(cacheKey, JSON.stringify(data), cacheExpiry);
+  };
+
+  /**
+   * Fetches project data, either from cache or the spreadsheet.
+   * @returns {Array} - The project data.
+   */
+  const fetchData = () => {
+    let projectInfo = fetchFromCache();
+
+    if (projectInfo) {
+      console.log('Data fetched from cache');
+    } else {
+      projectInfo = fetchFromSpreadsheet();
+      cacheData(projectInfo);
+      console.log('Data fetched from spreadsheet and cached');
+    }
+
+    return projectInfo;
+  };
+
+  /**
+   * Transforms project data into a nested structure.
+   * @returns {Object} - Nested structure of clients, projects, and tasks.
+   */
+  const getNestedStructure = () => {
+    const data = fetchData();
+    const nestedStructure = {};
+
+    data.forEach(([code, client, project, task, is_default, start, end, rate, description, comments]) => {
+      if (!nestedStructure[client]) {
+        nestedStructure[client] = {};
+      }
+      if (!nestedStructure[client][project]) {
+        nestedStructure[client][project] = [];
+      }
+      nestedStructure[client][project].push({
+        code,
+        task,
+        is_default,
+        start,
+        end,
+        rate,
+        description,
+        comments
+      });
+    });
+
+    return nestedStructure;
+  };
+
+  /**
+   * Retrieves active projects and tasks filtered by their start and end dates.
+   * Includes the 'code' field as well.
+   * @returns {Object} - A tree of active projects and tasks.
+   */
+  const getActiveProjectsTree = () => {
+    const data = fetchData();
+    const nestedStructure = {};
+    const today = new Date().setHours(0, 0, 0, 0);
+
+    data.forEach(([code, client, project, task, is_default, start, end, rate, description, comments]) => {
+      const startDate = start ? new Date(start).setHours(0, 0, 0, 0) : today;
+      const endDate = end ? new Date(end).setHours(0, 0, 0, 0) : today;
+
+      if (startDate <= today && endDate >= today) {
+        if (!nestedStructure[client]) {
+          nestedStructure[client] = {};
+        }
+        if (!nestedStructure[client][project]) {
+          nestedStructure[client][project] = [];
+        }
+        nestedStructure[client][project].push({
+          code,           // Include code here
+          task,
+          is_default,
+          start,
+          end,
+          rate,
+          description,
+          comments
+        });
+      }
+    });
+
+    return nestedStructure;
+  };
+
+  /**
+   * Retrieves a list of active clients based on project dates.
+   * @returns {Array} - Unique list of active clients.
+   */
+  const getActiveClients = () => {
+    const data = fetchData();
+    const today = new Date().setHours(0, 0, 0, 0);
+
+    const clients = data
+      .filter(([, client, , , , start, end]) => {
+        const startDate = start ? new Date(start).setHours(0, 0, 0, 0) : today;
+        const endDate = end ? new Date(end).setHours(0, 0, 0, 0) : today;
+        return startDate <= today && endDate >= today && client;
+      })
+      .map(([, client]) => client);
+
+    return [...new Set(clients)];
+  };
+
+  /**
+   * Retrieves all unique clients from the project data.
+   * @returns {Array} - Unique list of all clients.
+   */
+  const getClients = () => {
+    const data = fetchData();
+    return [...new Set(data.map(([, client]) => client))];
+  };
+
+  /**
+   * Retrieves all unique projects from the project data.
+   * @returns {Array} - Unique list of all projects.
+   */
+  const getProjects = () => {
+    const data = fetchData();
+    return [...new Set(data.map(([, , project]) => project))];
+  };
+
+  /**
+   * Retrieves a list of active projects based on project dates.
+   * @returns {Array} - Unique list of active projects.
+   */
+  const getActiveProjects = () => {
+    const data = fetchData();
+    const today = new Date().setHours(0, 0, 0, 0);
+
+    const projects = data
+      .filter(([, , project, , , start, end]) => {
+        const startDate = start ? new Date(start).setHours(0, 0, 0, 0) : today;
+        const endDate = end ? new Date(end).setHours(0, 0, 0, 0) : today;
+        return startDate <= today && endDate >= today && project;
+      })
+      .map(([, , project]) => project);
+
+    return [...new Set(projects)];
+  };
+
+  /**
+   * Retrieves all unique tasks from the project data, including the code.
+   * @returns {Array} - Unique list of all tasks with code and details.
+   */
+  const getTasks = () => {
+    const data = fetchData();
+    return data.map(([code, , , task, , , , rate, description, comments]) => ({
+      code,
+      task,
+      rate,
+      description,
+      comments
+    }));
+  };
+
+  /**
+   * Retrieves a list of active tasks based on project dates.
+   * @returns {Array} - Unique list of active tasks with their code and details.
+   */
+  const getActiveTasks = () => {
+    const data = fetchData();
+    const today = new Date().setHours(0, 0, 0, 0);
+
+    return data
+      .filter(([code, , , task, , start, end, rate, description, comments]) => {
+        const startDate = start ? new Date(start).setHours(0, 0, 0, 0) : today;
+        const endDate = end ? new Date(end).setHours(0, 0, 0, 0) : today;
+        return startDate <= today && endDate >= today && task;
+      })
+      .map(([code, , , task, , , , rate, description, comments]) => ({
+        code,
+        task,
+        rate,
+        description,
+        comments
+      }));
+  };
+
+  /**
+   * Syncs project data from the Google Sheet to the BigQuery `projects` table.
+   * Adds calculated fields `record_date_time` and `modified_time` during the sync.
+   * Clears the cache before syncing.
+   * @throws {Error} If syncing fails.
+   */
+  const syncToBigQuery = () => {
+    clearCache();
+    const data = fetchData();
+    const currentTime = new Date().toISOString();
+
+    const rows = data.map(([code, client, project, task, is_default, start, end, rate, description, comments, budgetedHours, companySize, categories], index) => {
+      const row = {
+        record_date_time: currentTime,
+        id: code ? String(code).trim() : null,
+        client: client ? String(client).trim() : null,
+        project: project ? String(project).trim() : null,
+        task: task ? String(task).trim() : null,
+        default: is_default === true || is_default === false ? is_default : null,
+        from: start ? new Date(start).toISOString().replace('T', ' ').split('.')[0] : null,
+        to: end ? new Date(end).toISOString().replace('T', ' ').split('.')[0] : null,
+        rate: typeof rate === 'number' ? rate : parseFloat(rate) || null,
+        description: description ? String(description).trim() : null,
+        comments: comments ? String(comments).trim() : null,
+        budgeted_hours: typeof budgetedHours === 'number' ? budgetedHours : parseFloat(budgetedHours) || null,
+        company_size: companySize ? String(companySize).trim() : null,
+        categories: categories ? categories.split(',').map(tag => tag.trim()) : [],
+        modified_time: currentTime
+      };
+
+      // Validate the row against mandatory fields
+      const mandatoryFields = ['record_date_time', 'id', 'client', 'project', 'task', 'from', 'to'];
+      mandatoryFields.forEach((field) => {
+        if (row[field] === null || row[field] === undefined) {
+          throw new Error(`Row ${index + 1}: Missing mandatory field "${field}".`);
+        }
+      });
+
+      return row;
+    });
+
+    try {
+      bigQueryManager.insertRows(rows);
+      console.log(`Successfully synced ${rows.length} rows to BigQuery.`);
+    } catch (error) {
+      console.error(`Error syncing data to BigQuery: ${error.message}`);
+      throw error;
+    }
+  };
+
+  return Object.freeze({
+    fetchData,           // Fetches data from cache or spreadsheet
+    getNestedStructure,  // Generates a nested structure of clients, projects, and tasks
+    getActiveProjectsTree, // Retrieves a tree of active projects and tasks (with code included)
+    getClients,          // Retrieves all unique clients
+    getActiveClients,    // Retrieves active clients based on project dates
+    getProjects,         // Retrieves all unique projects
+    getActiveProjects,   // Retrieves active projects based on project dates
+    getTasks,            // Retrieves all unique tasks with code
+    getActiveTasks,      // Retrieves active tasks with code
+    clearCache,          // Clears the cache
+    syncToBigQuery       // Syncs data to BigQuery
+  });
+};
+/**
+ * @OnlyCurrentDoc
+ */
+
+const gasSyncManager = (params = {}) => {
+  const {
+    projectId,
+    datasetId,
+    tableId = 'time',
+    calendarId
+  } = params;
+
+  if (!projectId || !datasetId || !tableId || !calendarId) {
+    throw new Error('projectId, datasetId, tableId, and calendarId are required');
+  }
+
+  /**
+   * Main function to sync calendar events to BigQuery.
+   */
+  const syncCalendarToBigQuery = () => {
+    const syncToken = getSyncToken();
+    const events = fetchCalendarEvents(syncToken);
+
+    if (events.length > 0) {
+      const enrichedEvents = addTimestamp(events);
+      insertEventsIntoBigQuery(enrichedEvents);
+      updateSyncToken();
+      console.info(`Synced ${enrichedEvents.length} events to BigQuery.`);
+    } else {
+      console.info('No new events to sync.');
+    }
+  };
+
+  /**
+   * Fetch events from Google Calendar.
+   * @param {string|null} syncToken - The sync token for incremental updates.
+   * @returns {Array<Object>} - List of calendar events.
+   */
+  const fetchCalendarEvents = (syncToken) => {
+    const optionalArgs = {
+      maxResults: 250,
+      showDeleted: true,
+      singleEvents: true,
+      orderBy: 'startTime'
+    };
+
+    if (syncToken) {
+      optionalArgs.syncToken = syncToken;
+    }
+
+    const response = Calendar.Events.list(calendarId, optionalArgs);
+    const events = response.items || [];
+
+    // Save the new sync token for future use
+    if (response.nextSyncToken) {
+      PropertiesService.getScriptProperties().setProperty('SYNC_TOKEN', response.nextSyncToken);
+    }
+
+    return events;
+  };
+
+  /**
+   * Add current timestamp to each event.
+   * @param {Array<Object>} events - List of events to enrich.
+   * @returns {Array<Object>} - Enriched events with a timestamp.
+   */
+  const addTimestamp = (events) => {
+    const currentTimestamp = new Date().toISOString();
+
+    return events.map(event => {
+      event.record_load_time = currentTimestamp;
+      return event;
+    });
+  };
+
+  /**
+   * Parse the Categories field from JSON string to an array.
+   * @param {string} categoriesJson - JSON string of categories.
+   * @returns {Array<string>} - Parsed categories array or empty array if invalid.
+   */
+  const parseCategories = (categoriesJson) => {
+    if (!categoriesJson) return [];
+    try {
+      const arr = JSON.parse(categoriesJson);
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) {
+      console.warn('Failed to parse categories JSON:', e);
+      return [];
+    }
+  };
+
+  /**
+   * Insert events into BigQuery.
+   * Enhanced to include extended properties and additional fields: 
+   * iCalUID, creator email, created_time, modified_time, 
+   * as well as Code, Client, Project, Task, Rate, Comments, CompanySize, Categories, OriginalTitle, deleted.
+   *
+   * @param {Array<Object>} events - List of enriched events to insert.
+   */
+  const insertEventsIntoBigQuery = (events) => {
+    const rows = events.map(event => {
+      const sharedProps = event.extendedProperties && event.extendedProperties.shared 
+        ? event.extendedProperties.shared 
+        : {};
+
+      return {
+        json: {
+          record_load_time: event.record_load_time,
+          id: event.id,
+          summary: event.summary || '',
+          description: event.description || '',
+          start: event.start.dateTime || event.start.date,
+          end: event.end.dateTime || event.end.date,
+          code: sharedProps.Code || '',
+          client: sharedProps.Client || '',
+          project: sharedProps.Project || '',
+          task: sharedProps.Task || '',
+          rate: sharedProps.Rate || '',
+          comments: sharedProps.Comments || '',
+          company_size: sharedProps.CompanySize || '',
+          categories: parseCategories(sharedProps.Categories),
+          original_title: sharedProps.OriginalTitle || '',
+          deleted: event.status === 'cancelled',
+          ical_uid: event.iCalUID || '',
+          creator_email: (event.creator && event.creator.email) || '',
+          created_time: event.created || '',
+          modified_time: event.updated || ''
+        }
+      };
+    });
+
+    const insertAllData = { rows: rows };
+    const response = BigQuery.Tabledata.insertAll(insertAllData, projectId, datasetId, tableId);
+
+    if (response.insertErrors) {
+      console.error('Errors occurred while inserting rows: ' + JSON.stringify(response.insertErrors));
+    }
+  };
+
+  /**
+   * Get the current sync token.
+   * @returns {string|null} - The sync token or null if not available.
+   */
+  const getSyncToken = () => {
+    return PropertiesService.getScriptProperties().getProperty('SYNC_TOKEN');
+  };
+
+  /**
+   * Update the sync token (handled in fetchCalendarEvents).
+   */
+  const updateSyncToken = () => {
+    // Sync token is updated in fetchCalendarEvents, no additional action needed here
+  };
+
+  /**
+   * Reset the sync token to perform a full sync.
+   */
+  const resetSyncToken = () => {
+    PropertiesService.getScriptProperties().deleteProperty('SYNC_TOKEN');
+    console.info('Sync token has been reset. The next sync will perform a full sync.');
+  };
+
+  return Object.freeze({
+    syncCalendarToBigQuery,
+    fetchCalendarEvents,
+    addTimestamp,
+    insertEventsIntoBigQuery,
+    getSyncToken,
+    updateSyncToken,
+    resetSyncToken
+  });
+};
+/* global Calendar, console, Session */
+
+/**
+ * @file gasCalendarManager.js
+ * @description Provides methods to manage Google Calendar resources such as calendars and events.
+ * This module supports:
+ * - Creating new calendars (if not provided) with a given name.
+ * - Creating events with specified details.
+ * - Updating existing events.
+ * - Retrieving event information.
+ * - Storing and updating extended properties for metadata.
+ *
+ * If the calendar already exists (HTTP 409), it logs a warning and treats the operation as successful,
+ * returning the existing calendar's ID.
+ *
+ * Requires the Google Calendar Advanced Service to be enabled in your Apps Script project.
+ *
+ * @OnlyCurrentDoc
+ */
+
+/**
+ * gasCalendarManager
+ *
+ * Responsible for:
+ * - Creating a new Google Calendar with the specified name if needed.
+ * - Creating events in a specified Google Calendar.
+ * - Updating existing events' details and extended properties.
+ * - Retrieving event information by event ID.
+ *
+ * @param {Object} params - Parameters for initializing the calendar manager.
+ * @param {string} [params.calendarId] - The ID of the calendar to manage (optional).
+ * @param {string} [params.calendarName] - The name of a calendar to create if needed.
+ * @param {Object} [params.logManager=console] - Logger for debugging (defaults to console).
+ * @returns {Object} An object with methods to manage calendar events and create a new calendar.
+ */
+const gasCalendarManager = (params = {}) => {
+  const {
+    calendarId = null,
+    calendarName,
+    logManager = console
+  } = params;
+
+  let activeCalendarId = calendarId;
+
+  /**
+   * Create a new event in the calendar using the Calendar advanced service.
+   *
+   * The 'description' field is used as the event summary.
+   *
+   * @param {Object} eventDetails - Details of the event to create.
+   * @param {Date} eventDetails.startTime - Event start time (Date object).
+   * @param {Date} eventDetails.endTime - Event end time (Date object).
+   * @param {string} [eventDetails.description='Untitled Event'] - Used as the event summary.
+   * @param {string} [eventDetails.location=''] - Event location.
+   * @param {string} [eventDetails.client=''] - Client metadata.
+   * @param {string} [eventDetails.project=''] - Project metadata.
+   * @param {string} [eventDetails.task=''] - Task metadata.
+   * @param {string} [eventDetails.code=''] - Code metadata.
+   * @param {string} [eventDetails.rate=''] - Rate metadata.
+   * @param {string} [eventDetails.comments=''] - Comments metadata.
+   * @param {string} [eventDetails.companySize=''] - Company size metadata.
+   * @param {Array} [eventDetails.categories=[]] - Categories as an array.
+   * @param {string} [eventDetails.originalTitle=''] - Original title from the UI.
+   * @returns {string} The ID of the created event.
+   * @throws {Error} If startTime/endTime are missing or invalid, or if no calendarId is set.
+   */
+  const createEvent = (eventDetails) => {
+    if (!activeCalendarId) {
+      throw new Error('gasCalendarManager: calendarId is required to create an event.');
+    }
+
+    const {
+      startTime,
+      endTime,
+      description = 'Untitled Event',
+      location = '',
+      client = '',
+      project = '',
+      task = '',
+      code = '',
+      rate = '',
+      comments = '',
+      companySize = '',
+      categories = [],
+      originalTitle = ''
+    } = eventDetails;
+
+    validateEventTimes(startTime, endTime);
+
+    const eventResource = {
+      summary: description,
+      description: "",
+      location,
+      start: { dateTime: startTime.toISOString(), timeZone: 'UTC' },
+      end: { dateTime: endTime.toISOString(), timeZone: 'UTC' },
+      extendedProperties: {
+        shared: {
+          Code: code,
+          Client: client,
+          Project: project,
+          Task: task,
+          Rate: rate,
+          Comments: comments,
+          CompanySize: companySize,
+          Categories: JSON.stringify(categories),
+          OriginalTitle: originalTitle
+        }
+      }
+    };
+
+    const event = Calendar.Events.insert(eventResource, activeCalendarId);
+    logManager.info(`gasCalendarManager: Created event '${description}' with ID: ${event.id}`);
+    return event.id;
+  };
+
+  /**
+   * Update an existing event with new details.
+   *
+   * @param {string} eventId - The ID of the event to update.
+   * @param {Object} updates - Updated event fields.
+   * @throws {Error} If the event cannot be found, times are invalid, or if no calendarId is set.
+   */
+  const updateEvent = (eventId, updates) => {
+    if (!activeCalendarId) {
+      throw new Error('gasCalendarManager: calendarId is required to update an event.');
+    }
+
+    const event = getEvent(eventId);
+    if (!event) {
+      throw new Error(`gasCalendarManager.updateEvent: Event not found for ID: ${eventId}`);
+    }
+
+    const resource = {};
+
+    if (updates.startTime && updates.endTime) {
+      validateEventTimes(updates.startTime, updates.endTime);
+      resource.start = { dateTime: updates.startTime.toISOString(), timeZone: 'UTC' };
+      resource.end = { dateTime: updates.endTime.toISOString(), timeZone: 'UTC' };
+    } else if (updates.startTime || updates.endTime) {
+      throw new Error("gasCalendarManager.updateEvent: Both startTime and endTime must be provided to update event times.");
+    }
+
+    if (updates.description !== undefined) {
+      resource.summary = updates.description;
+    }
+
+    if (updates.location !== undefined) {
+      resource.location = updates.location;
+    }
+
+    const sharedProps = (event.extendedProperties && event.extendedProperties.shared) || {};
+    const code = updates.code !== undefined ? updates.code : sharedProps.Code || '';
+    const client = updates.client !== undefined ? updates.client : sharedProps.Client || '';
+    const project = updates.project !== undefined ? updates.project : sharedProps.Project || '';
+    const task = updates.task !== undefined ? updates.task : sharedProps.Task || '';
+    const rate = updates.rate !== undefined ? updates.rate : sharedProps.Rate || '';
+    const comments = updates.comments !== undefined ? updates.comments : sharedProps.Comments || '';
+    const companySize = updates.companySize !== undefined ? updates.companySize : sharedProps.CompanySize || '';
+    const categories = updates.categories !== undefined ? JSON.stringify(updates.categories) : (sharedProps.Categories || JSON.stringify([]));
+    const originalTitle = updates.originalTitle !== undefined ? updates.originalTitle : sharedProps.OriginalTitle || '';
+
+    resource.extendedProperties = {
+      shared: {
+        Code: code,
+        Client: client,
+        Project: project,
+        Task: task,
+        Rate: rate,
+        Comments: comments,
+        CompanySize: companySize,
+        Categories: categories,
+        OriginalTitle: originalTitle
+      }
+    };
+
+    const updatedEvent = Calendar.Events.patch(resource, activeCalendarId, eventId);
+    logManager.info(`gasCalendarManager: Updated event with ID: ${updatedEvent.id}`);
+  };
+
+  /**
+   * Creates a Google Calendar with the specified name.
+   * If the calendar already exists (HTTP 409), logs a warning and returns the existing calendar's ID.
+   *
+   * @returns {string} The ID of the newly created or existing calendar.
+   * @throws {Error} If calendarName is not provided or other errors occur.
+   */
+  const createCalendar = () => {
+    if (!calendarName) {
+      throw new Error('calendarName is required to create a new calendar');
+    }
+
+    try {
+      const userTimeZone = Session.getScriptTimeZone();
+      const calendarResource = {
+        summary: calendarName,
+        timeZone: userTimeZone
+      };
+
+      const newCalendar = Calendar.Calendars.insert(calendarResource);
+      activeCalendarId = newCalendar.id;
+      logManager.info(`Calendar "${calendarName}" created successfully with ID: ${newCalendar.id}`);
+      return newCalendar.id;
+    } catch (error) {
+      // Handle GoogleJsonResponseException for calendar creation
+      if (error.name === 'GoogleJsonResponseException' && error.details) {
+        const statusCode = error.details.code;
+        const message = error.details.message;
+
+        if (statusCode === 409) {
+          // Calendar already exists
+          logManager.warn(`Calendar "${calendarName}" already exists. Retrieving existing calendar ID.`);
+          const existingCalendars = Calendar.CalendarList.list().items || [];
+          const found = existingCalendars.find(cal => cal.summary.toLowerCase() === calendarName.toLowerCase());
+
+          if (found) {
+            activeCalendarId = found.id;
+            return found.id;
+          }
+
+          // If for some reason we can't find it now, this is unexpected.
+          logManager.error(`Calendar already exists but cannot find it by name: ${calendarName}.`);
+          throw new Error(`Calendar "${calendarName}" already exists, but could not retrieve its ID.`);
+        }
+
+        logManager.error(`Calendar creation error (Code: ${statusCode}): ${message}`);
+        throw error;
+      } else {
+        logManager.error(`Unexpected error creating calendar: ${error.message}`);
+        throw error;
+      }
+    }
+  };
+
+  /**
+   * Retrieve an event by its ID.
+   *
+   * @param {string} eventId - The event ID.
+   * @returns {Object|null} The event object if found, otherwise null.
+   */
+  const getEvent = (eventId) => {
+    if (!activeCalendarId) {
+      throw new Error('gasCalendarManager: calendarId is required to get an event.');
+    }
+
+    try {
+      return Calendar.Events.get(activeCalendarId, eventId);
+    } catch (e) {
+      logManager.warn(`gasCalendarManager.getEvent failed for ID: ${eventId}, error: ${e}`);
+      return null;
+    }
+  };
+
+  /**
+   * Validates that the event start time is before the end time.
+   *
+   * @param {Date} start - The start time.
+   * @param {Date} end - The end time.
+   * @throws {Error} If times are invalid or start >= end.
+   */
+  const validateEventTimes = (start, end) => {
+    if (!(start instanceof Date) || !(end instanceof Date)) {
+      throw new Error("gasCalendarManager: startTime and endTime must be valid Date objects.");
+    }
+    if (start >= end) {
+      throw new Error("gasCalendarManager: Event start time must be before end time.");
+    }
+  };
+
+  return Object.freeze({
+    createEvent,
+    updateEvent,
+    getEvent,
+    createCalendar
+  });
+};
+/* global BigQuery, console */
+
+/**
+ * @file gasBigQueryManager.js
+ * @description Provides methods to manage BigQuery resources such as datasets and tables.
+ * This module supports creating datasets and tables, inserting rows, and deleting data based on queries.
+ */
+
+/**
+ * The `gasBigQueryManager` is responsible for managing BigQuery resources within a Google Cloud project.
+ * It offers methods to:
+ * - Create datasets and tables.
+ * - Insert rows into tables.
+ * - Delete rows using SQL queries.
+ *
+ * If the dataset or table already exists (HTTP 409), it logs a warning and treats the operation as successful.
+ *
+ * @param {Object} params - Configuration parameters.
+ * @param {string} params.projectId - The ID of the Google Cloud project.
+ * @param {string} params.datasetId - The ID of the BigQuery dataset.
+ * @param {string} [params.tableId] - The ID of the BigQuery table (optional).
+ * @returns {Object} - Methods for interacting with BigQuery resources.
+ */
+const gasBigQueryManager = (params = {}) => {
+  const {
+    projectId,
+    datasetId,
+    tableId
+  } = params;
+
+  if (!projectId || !datasetId) {
+    throw new Error("projectId and datasetId are required");
+  }
+
+  /**
+   * Creates a BigQuery dataset if it doesn't already exist.
+   * Logs a warning if the dataset already exists (HTTP 409).
+   * @throws {Error} If the dataset creation fails for reasons other than already existing.
+   */
+  const createDataset = () => {
+    try {
+      const datasetResource = {
+        datasetReference: {
+          datasetId,
+          projectId
+        }
+      };
+
+      BigQuery.Datasets.insert(datasetResource, projectId);
+      console.info(`Dataset "${datasetId}" created successfully.`);
+    } catch (error) {
+      if (error.name === 'GoogleJsonResponseException' && error.details) {
+        const statusCode = error.details.code;
+        const message = error.details.message;
+        if (statusCode === 409) {
+          // Dataset already exists
+          console.warn(`Dataset "${datasetId}" already exists.`);
+          return;
+        }
+        console.error(`BigQuery Error (Code: ${statusCode}): ${message}`);
+        throw error;
+      } else {
+        console.error(`Unexpected error: ${error.message}`);
+        throw error;
+      }
+    }
+  };
+
+  /**
+   * Creates a BigQuery table with the given schema.
+   * Logs a warning if the table already exists (HTTP 409).
+   * @param {string} tId - The ID of the table to create.
+   * @param {Array<Object>} schema - The schema definition for the table.
+   * @throws {Error} If the table creation fails for reasons other than already existing.
+   */
+  const createTable = (tId, schema) => {
+    try {
+      const tableResource = {
+        tableReference: {
+          projectId,
+          datasetId,
+          tableId: tId
+        },
+        schema: {
+          fields: schema
+        }
+      };
+
+      BigQuery.Tables.insert(tableResource, projectId, datasetId);
+      console.info(`Table "${tId}" created successfully in dataset "${datasetId}".`);
+    } catch (error) {
+      if (error.name === 'GoogleJsonResponseException' && error.details) {
+        const statusCode = error.details.code;
+        const message = error.details.message;
+        if (statusCode === 409) {
+          // Table already exists
+          console.warn(`Table "${tId}" already exists in dataset "${datasetId}".`);
+          return;
+        }
+        console.error(`BigQuery Error (Code: ${statusCode}): ${message}`);
+        throw error;
+      } else {
+        console.error(`Unexpected error: ${error.message}`);
+        throw error;
+      }
+    }
+  };
+
+  /**
+   * Inserts multiple rows into a BigQuery table.
+   * @param {Array<Object>} rows - Array of row objects to insert.
+   * @throws {Error} If the insertion fails.
+   */
+  const insertRows = (rows) => {
+    if (!Array.isArray(rows)) {
+      throw new Error("Rows must be an array of objects");
+    }
+
+    const insertAllData = {
+      rows: rows.map((row) => ({ json: row }))
+    };
+
+    try {
+      const response = BigQuery.Tabledata.insertAll(insertAllData, projectId, datasetId, tableId);
+
+      if (response.insertErrors && response.insertErrors.length > 0) {
+        console.error(`Insert Errors: ${JSON.stringify(response.insertErrors)}`);
+        throw new Error(`Errors occurred while inserting rows: ${JSON.stringify(response.insertErrors)}`);
+      }
+
+      console.info(`Successfully inserted ${rows.length} rows into ${projectId}.${datasetId}.${tableId}`);
+    } catch (error) {
+      console.error(`Error inserting rows: ${error.message}`);
+      throw error;
+    }
+  };
+
+  /**
+   * Deletes rows from a BigQuery table based on a query.
+   * @param {string} whereClause - The WHERE clause to identify rows to delete.
+   * @throws {Error} If the deletion fails.
+   */
+  const deleteRows = (whereClause) => {
+    if (!whereClause) {
+      throw new Error("WHERE clause is required to delete rows.");
+    }
+
+    const deleteQuery = `
+      DELETE FROM \`${projectId}.${datasetId}.${tableId}\`
+      WHERE ${whereClause};
+    `;
+
+    try {
+      const request = {
+        query: deleteQuery,
+        useLegacySql: false
+      };
+
+      const queryResults = BigQuery.Jobs.query(request, projectId);
+
+      if (!queryResults.jobComplete) {
+        throw new Error("Delete query did not complete successfully.");
+      }
+
+      console.info(`Rows deleted successfully from ${projectId}.${datasetId}.${tableId} where ${whereClause}`);
+    } catch (error) {
+      console.error(`Error deleting rows: ${error.message}`);
+      throw error;
+    }
+  };
+
+  return Object.freeze({
+    createDataset,
+    createTable,
+    insertRows,
+    deleteRows
+  });
+};
+/* global BigQuery, Calendar, SpreadsheetApp, console */
+
+/**
+ * The gasConfigManager is responsible for managing application configuration, initialization,
+ * and setup processes. It handles tasks such as saving and retrieving configurations,
+ * initializing application resources like BigQuery datasets and tables, copying a template spreadsheet,
+ * and resetting the app configuration.
+ */
+const gasConfigManager = (params = {}) => {
+  const {
+    defaultSpreadsheetId,
+    defaultCalendarId
+  } = params;
+
+  const CONFIG_FLAG = 'IS_INITIALIZED';
+  const TEMPLATE_SPREADSHEET_ID = '15bpKYmmfzFUqsbviv83rvMJGxwGlZD7JQ6tOklymDwQ';
+
+  /**
+   * Checks if the app is initialized by validating the initialization flag in User Properties.
+   * @returns {boolean} - Returns true if the app is initialized.
+   */
+  const isInitialized = () => {
+    const properties = PropertiesService.getUserProperties();
+    const initialized = properties.getProperty(CONFIG_FLAG) === 'true';
+    console.log(`ConfigManager: App is ${initialized ? 'initialized' : 'not initialized'}.`);
+    return initialized;
+  };
+
+  /**
+   * Marks the app as initialized by setting the initialization flag.
+   * @param {boolean} flag - The flag value to set (true or false).
+   */
+  const setInitialized = (flag) => {
+    const properties = PropertiesService.getUserProperties();
+    properties.setProperty(CONFIG_FLAG, flag ? 'true' : 'false');
+    console.log(`ConfigManager: App initialization flag set to ${flag}.`);
+  };
+
+  /**
+   * Saves the required configurations (Spreadsheet ID, Calendar ID, Project ID, Dataset ID) into User Properties.
+   * @param {Object} config - The configuration object containing `spreadsheetId`, `calendarId`, `projectId`, and `datasetId`.
+   * @throws {Error} If required properties are missing.
+   */
+  const saveConfiguration = (config) => {
+    const { spreadsheetId, calendarId, projectId, datasetId } = config;
+
+    if (!spreadsheetId || !calendarId || !projectId || !datasetId) {
+      throw new Error('Spreadsheet ID, Calendar ID, Project ID, and Dataset ID are required for initialization.');
+    }
+
+    try {
+      const properties = PropertiesService.getUserProperties();
+      properties.setProperties({
+        SPREADSHEET_ID: spreadsheetId,
+        CALENDAR_ID: calendarId,
+        PROJECT_ID: projectId,
+        DATASET_ID: datasetId
+      });
+
+      setInitialized(true); // Mark as initialized
+      console.log('ConfigManager: Configuration saved successfully.');
+    } catch (error) {
+      console.error(`ConfigManager: Error saving configuration: ${error.message}`);
+      throw error;
+    }
+  };
+
+  /**
+   * Retrieves the current configuration from User Properties.
+   * @returns {Object} - The current configuration containing `spreadsheetId`, `calendarId`, `projectId`, and `datasetId`.
+   */
+  const getConfiguration = () => {
+    const properties = PropertiesService.getUserProperties();
+    const spreadsheetId = properties.getProperty('SPREADSHEET_ID') || defaultSpreadsheetId;
+    const calendarId = properties.getProperty('CALENDAR_ID') || defaultCalendarId;
+    const projectId = properties.getProperty('PROJECT_ID');
+    const datasetId = properties.getProperty('DATASET_ID');
+
+    if (!spreadsheetId || !calendarId || !projectId || !datasetId) {
+      console.warn('ConfigManager: Configuration is incomplete.');
+    }
+
+    return { spreadsheetId, calendarId, projectId, datasetId };
+  };
+
+  /**
+   * Creates a copy of the template Google Sheet with the given name.
+   * @param {string} copyName - The name of the copied spreadsheet.
+   * @returns {string} - The ID of the copied spreadsheet.
+   * @throws {Error} If the sheet copying fails.
+   */
+  const createSheetCopy = (copyName = 'Arabellix Time Projects') => {
+    try {
+      const templateSpreadsheet = SpreadsheetApp.openById(TEMPLATE_SPREADSHEET_ID);
+      const newSpreadsheet = templateSpreadsheet.copy(copyName);
+      console.log(`Spreadsheet copied successfully with ID: ${newSpreadsheet.getId()}`);
+      return newSpreadsheet.getId();
+    } catch (error) {
+      console.error(`ConfigManager: Error copying spreadsheet: ${error.message}`);
+      throw error;
+    }
+  };
+
+  /**
+   * Completes the entire configuration process including creating datasets, tables, calendar, and a spreadsheet copy.
+   * @param {Object} config - The configuration object containing `projectId`, `datasetId`, and `calendarName`.
+   * @returns {Object} - Status and messages for the configuration process.
+   */
+  const configureApp = (config) => {
+    const { projectId, datasetId = 'ara_time', calendarName = 'ara time' } = config;
+
+    if (!projectId) {
+      throw new Error('BigQuery Project ID is required.');
+    }
+
+    const messages = [];
+
+    try {
+      // Step 1: Create BigQuery Dataset
+      const bigQueryManager = gasBigQueryManager({ projectId, datasetId });
+      bigQueryManager.createDataset();
+      messages.push(`Dataset "${datasetId}" created successfully.`);
+
+      // Step 2: Create "time" Table
+      bigQueryManager.createTable('time', TIME_TABLE_SCHEMA);
+      messages.push('Table "time" created successfully.');
+
+      // Step 3: Create "projects" Table
+      bigQueryManager.createTable('projects', PROJECT_TABLE_SCHEMA);
+      messages.push('Table "projects" created successfully.');
+
+      // Step 4: Create Calendar
+      const calendarManager = gasCalendarManager({ calendarName });
+      const calendarId = calendarManager.createCalendar();
+      messages.push(`Calendar "${calendarName}" created successfully with ID: ${calendarId}.`);
+
+      // Step 5: Create Sheet Copy
+      const spreadsheetId = createSheetCopy();
+      messages.push('Spreadsheet copied successfully.');
+
+      // Step 6: Save Configuration
+      saveConfiguration({ projectId, datasetId, calendarName, spreadsheetId, calendarId });
+
+      return { success: true, messages };
+    } catch (error) {
+      console.error(`ConfigManager: Configuration process failed: ${error.message}`);
+      return { success: false, messages: [`Setup failed: ${error.message}`] };
+    }
+  };
+
+  /**
+   * Resets the initialization state by clearing only the properties managed by ConfigManager.
+   * Ensures dependent services or states are also reset.
+   * @throws {Error} If the reset fails.
+   */
+  const resetConfiguration = () => {
+    try {
+      const properties = PropertiesService.getUserProperties();
+      const keysToDelete = ['SPREADSHEET_ID', 'CALENDAR_ID', 'PROJECT_ID', 'DATASET_ID', CONFIG_FLAG];
+      keysToDelete.forEach(key => properties.deleteProperty(key));
+
+      // Reset dependent states or services if applicable
+      console.log('ConfigManager: Configuration reset successfully.');
+    } catch (error) {
+      console.error(`ConfigManager: Error resetting configuration: ${error.message}`);
+      throw error;
+    }
+  };
+
+  return Object.freeze({
+    isInitialized, // Check if the app is initialized
+    setInitialized, // Set or reset the initialization flag
+    saveConfiguration, // Save configuration to User Properties
+    getConfiguration, // Retrieve configuration from User Properties
+    createSheetCopy, // Copy the template spreadsheet
+    configureApp, // Complete the setup process
+    resetConfiguration // Reset the app configuration
+  });
+};
+/**
+ * @file integrationSyncTest.js
+ * @description Tests the integration of gasBigQueryManager and gasProjectInfoManager by syncing data from a Google Sheet to BigQuery.
+ */
+
+const runSyncTest = () => {
+  const cache = CacheService.getUserCache();
+  cache.removeAll(['syncProjectInfo'])
+  try {
+    // Step 1: Initialize ConfigManager to load configuration
+    const configManager = gasConfigManager({
+      defaultSpreadsheetId: 'YOUR_SPREADSHEET_ID',
+      defaultCalendarId: 'YOUR_CALENDAR_ID'
+    });
+    const config = configManager.getConfiguration();
+    console.log('Loaded Configuration:', config);
+
+    // Step 2: Initialize BigQueryManager
+    const bigQueryManager = gasBigQueryManager({
+      projectId: config.projectId,
+      datasetId: config.datasetId,
+      tableId: 'projects'
+    });
+
+    // Step 3: Ensure dataset and table exist
+    bigQueryManager.createDataset();
+    console.log(`Dataset "${config.datasetId}" verified or created.`);
+
+    bigQueryManager.createTable('projects', PROJECT_SCHEMA);
+    console.log('Table "projects" created successfully with PROJECT_SCHEMA.');
+
+    // Step 4: Initialize ProjectInfoManager
+    const projectManager = gasProjectInfoManager({
+      spreadsheetId: config.spreadsheetId,
+      sheetName: 'Projects',
+      cacheKey: 'syncProjectInfo',
+      cacheExpiry: 0, 
+      bigQueryManager
+    });
+
+    // Step 5: Sync project data from the Google Sheet to BigQuery
+    projectManager.syncToBigQuery();
+    console.log('Project data synchronized successfully from Google Sheet to BigQuery.');
+
+  } catch (error) {
+    console.error('Error during sync test:', error.message);
+  }
+};
+
+
+/**
+ * @file ProjectSchema.js
+ * @description Defines the schema for project-related data used in BigQuery.
+ * This schema provides a structured and validated way to store and manage project metadata, 
+ * ensuring consistency and supporting advanced reporting and querying capabilities.
+ */
+
+/**
+ * The Project Schema defines the structure and metadata for storing project-related information
+ * in BigQuery. Each field is designed to represent key attributes of a project, allowing for
+ * detailed analysis and tracking. This schema supports optional and required fields,
+ * flexible categorization, and proper handling of timestamps for audit purposes.
+ * 
+ * Fields:
+ * - `record_date_time` (TIMESTAMP, REQUIRED): Timestamp of when the record was created.
+ * - `id` (STRING, REQUIRED): Unique identifier for the project.
+ * - `client` (STRING, REQUIRED): Name or identifier of the client associated with the project.
+ * - `project` (STRING, REQUIRED): Name or identifier of the project. Ensure uniqueness.
+ * - `task` (STRING, REQUIRED): Description or identifier of the task associated with the project.
+ * - `default` (BOOLEAN, NULLABLE): Boolean flag indicating if the project is a default entry.
+ * - `from` (TIMESTAMP, REQUIRED): Start timestamp for the project.
+ * - `to` (TIMESTAMP, REQUIRED): End timestamp for the project; ongoing projects require a valid timestamp.
+ * - `rate` (NUMERIC, NULLABLE): Financial rate associated with the project (e.g., hourly rate).
+ * - `description` (STRING, NULLABLE): Additional details about the project.
+ * - `comments` (STRING, NULLABLE): Free-form text for comments or remarks.
+ * - `budgeted_hours` (NUMERIC, NULLABLE): Estimated hours allocated to the project.
+ * - `company_size` (STRING, NULLABLE): Size of the client company in terms of employees or revenue.
+ * - `categories` (REPEATED STRING, NULLABLE): List of categories or tags for flexible classification.
+ * - `last_updated_time` (TIMESTAMP, NULLABLE): Timestamp of the last modification to the record.
+ */
+const TIME_TABLE_SCHEMA = [
+  { name: 'record_load_time', type: 'TIMESTAMP', mode: 'REQUIRED' },
+  { name: 'id', type: 'STRING', mode: 'REQUIRED' },
+  { name: 'summary', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'description', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'start', type: 'TIMESTAMP', mode: 'REQUIRED' },
+  { name: 'end', type: 'TIMESTAMP', mode: 'NULLABLE' },
+  { name: 'code', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'client', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'project', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'task', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'rate', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'comments', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'company_size', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'categories', type: 'STRING', mode: 'REPEATED' },
+  { name: 'original_title', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'deleted', type: 'BOOL', mode: 'NULLABLE' },
+  { name: 'ical_uid', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'creator_email', type: 'STRING', mode: 'NULLABLE' },
+  { name: 'created_time', type: 'TIMESTAMP', mode: 'NULLABLE' },
+  { name: 'modified_time', type: 'TIMESTAMP', mode: 'NULLABLE' }
+];
+
+
+  /**
+ * @file ProjectSchema.js
+ * @description Defines the schema for project-related data used in BigQuery.
+ * This schema provides a structured and validated way to store and manage project metadata, 
+ * ensuring consistency and supporting advanced reporting and querying capabilities.
+ */
+
+/**
+ * The Project Schema defines the structure and metadata for storing project-related information
+ * in BigQuery. Each field is designed to represent key attributes of a project, allowing for
+ * detailed analysis and tracking. This schema supports optional and required fields,
+ * flexible categorization, and proper handling of timestamps for audit purposes.
+ * 
+ * Fields:
+ * - `record_date_time` (TIMESTAMP, REQUIRED): Timestamp of when the record was created.
+ * - `id` (STRING, REQUIRED): Unique identifier for the project.
+ * - `client` (STRING, REQUIRED): Name or identifier of the client associated with the project.
+ * - `project` (STRING, REQUIRED): Name or identifier of the project. Ensure uniqueness.
+ * - `task` (STRING, REQUIRED): Description or identifier of the task associated with the project.
+ * - `default` (BOOLEAN, NULLABLE): Boolean flag indicating if the project is a default entry.
+ * - `from` (TIMESTAMP, REQUIRED): Start timestamp for the project.
+ * - `to` (TIMESTAMP, REQUIRED): End timestamp for the project; ongoing projects require a valid timestamp.
+ * - `rate` (NUMERIC, NULLABLE): Financial rate associated with the project (e.g., hourly rate).
+ * - `description` (STRING, NULLABLE): Additional details about the project.
+ * - `comments` (STRING, NULLABLE): Free-form text for comments or remarks.
+ * - `budgeted_hours` (NUMERIC, NULLABLE): Estimated hours allocated to the project.
+ * - `company_size` (STRING, NULLABLE): Size of the client company in terms of employees or revenue.
+ * - `categories` (REPEATED STRING, NULLABLE): List of categories or tags for flexible classification.
+ * - `last_updated_time` (TIMESTAMP, NULLABLE): Timestamp of the last modification to the record.
+ */
+const PROJECT_TABLE_SCHEMA = [
+    { 
+      name: 'record_date_time', 
+      type: 'TIMESTAMP', 
+      mode: 'REQUIRED', 
+      description: 'The timestamp when the record was created. Required for audit trails.' 
+    },
+    { 
+      name: 'id', 
+      type: 'STRING', 
+      mode: 'REQUIRED', 
+      description: 'A unique identifier for the project. Critical for identifying and querying projects.' 
+    },
+    { 
+      name: 'client', 
+      type: 'STRING', 
+      mode: 'REQUIRED', 
+      description: 'The name or identifier of the client associated with the project. Links projects to customers.' 
+    },
+    { 
+      name: 'project', 
+      type: 'STRING', 
+      mode: 'REQUIRED', 
+      description: 'The name or identifier of the project. Ensure it is unique for accurate identification.' 
+    },
+    { 
+      name: 'task', 
+      type: 'STRING', 
+      mode: 'REQUIRED', 
+      description: 'Description or identifier of the task within the project. Optional for more granular tracking.' 
+    },
+    { 
+      name: 'default', 
+      type: 'BOOLEAN', 
+      mode: 'NULLABLE', 
+      description: 'Flag indicating if this project is a default entry. Useful for configuration purposes.' 
+    },
+    { 
+      name: 'from', 
+      type: 'TIMESTAMP', 
+      mode: 'REQUIRED', 
+      description: 'The start date and time for the project. Marks the beginning of the project timeline.' 
+    },
+    { 
+      name: 'to', 
+      type: 'TIMESTAMP', 
+      mode: 'REQUIRED', 
+      description: 'The end date and time for the project. Ongoing projects require a valid timestamp.' 
+    },
+    { 
+      name: 'rate', 
+      type: 'NUMERIC', 
+      mode: 'NULLABLE', 
+      description: 'The financial rate associated with the project (e.g., hourly rate). Provides cost insights.' 
+    },
+    { 
+      name: 'description', 
+      type: 'STRING', 
+      mode: 'NULLABLE', 
+      description: 'Additional details or notes about the project. Useful for context or descriptions.' 
+    },
+    { 
+      name: 'comments', 
+      type: 'STRING', 
+      mode: 'NULLABLE', 
+      description: 'Free-form text for comments or remarks related to the project.' 
+    },
+    { 
+      name: 'budgeted_hours', 
+      type: 'NUMERIC', 
+      mode: 'NULLABLE', 
+      description: 'Estimated hours allocated for completing the project. Useful for planning and tracking.' 
+    },
+    { 
+      name: 'company_size', 
+      type: 'STRING', 
+      mode: 'NULLABLE', 
+      description: 'The size of the client company in terms of employees or revenue. Helps classify customers.' 
+    },
+    { 
+      name: 'categories', 
+      type: 'STRING', 
+      mode: 'REPEATED', 
+      description: 'List of categories or tags associated with the project. Supports flexible classification.' 
+    },
+    { 
+      name: 'modified_time', 
+      type: 'TIMESTAMP', 
+      mode: 'NULLABLE', 
+      description: 'The timestamp of the last modification made to the project record. Ensures data freshness.' 
+    }
+  ];
+  /**
+ * @file EventCard.js
+ * @description Provides a UI for updating an existing event, using logic derived from the provided example.
+ *
+ * Features:
+ * - Fetch existing event details from Calendar using calendarId and eventId.
+ * - Uses extendedProperties to pre-populate client, project, and task.
+ * - If `parameters.event` is not defined, we populate fields from the existing event.
+ * - If `parameters.event` is "inputChangeClient", we reset project selection.
+ * - If `parameters.action` is "update", we update the card.
+ * - If `parameters.action` is "save", we patch the event in the calendar.
+ */
+
+const EventCard = (params = {}) => {
+  const {
+    logManager = console,
+    parameters = {},
+    formInput = {},
+    calendar, // object with calendarId and id of the event
+    ...rest
+  } = params;
+
+  const eventParam = parameters.event;    // e.g. 'inputChangeClient'
+  const action = parameters.action;       // e.g. 'update', 'save'
+  const eventId = calendar?.id;
+  const calendarId = calendar?.calendarId;
+
+  logManager.log(`EventCard called with event: ${eventParam}, action: ${action}, eventId: ${eventId}`);
+
+  // Validate eventId and calendar
+  if (!calendarId || !eventId) {
+    logManager.error("Calendar information is incomplete or eventId is missing.");
+    return CardService.newActionResponseBuilder()
+      .setNotification(CardService.newNotification().setText("Error: Missing calendar information or eventId."))
+      .build();
+  }
+
+  // Initialize configuration and check if app is ready
+  const configManager = gasConfigManager();
+  if (!configManager.isInitialized()) {
+    logManager.log("App not initialized. Redirecting to AdminCard.");
+    return AdminCard(params);
+  }
+
+  const { projectId, datasetId, spreadsheetId } = configManager.getConfiguration();
+  const projectInfoManager = gasProjectInfoManager({
+    spreadsheetId,
+    bigQueryManager: gasBigQueryManager({ projectId, datasetId, tableId: "projects" })
+  });
+
+  // Fetch the existing event from Calendar
+  let calendarEvent;
+  try {
+    calendarEvent = Calendar.Events.get(calendarId, eventId);
+  } catch (error) {
+    logManager.error(`Error fetching event: ${error.message}`);
+    return CardService.newActionResponseBuilder()
+      .setNotification(CardService.newNotification().setText(`Failed to load event: ${error.message}`))
+      .build();
+  }
+
+  const extendedProperties = calendarEvent.extendedProperties?.shared || {};
+  let eventTitle = formInput.eventTitle || "";
+  let client = formInput.Client;
+  let project = formInput.Project;
+  let task = formInput.Task;
+
+  // If we don't have an eventParam (meaning first load), populate from the existing event
+  if (!eventParam) {
+    // Set default values for tags and event title from the event
+    client = client || extendedProperties.Client || "";
+    project = project || extendedProperties.Project || "";
+    task = task || extendedProperties.Task || "";
+    eventTitle = eventTitle || calendarEvent.summary || "";
+  }
+
+  // If user changed client, reset project as per example logic
+  if (eventParam === "inputChangeClient") {
+    project = undefined;
+  }
+
+  const nestedItems = projectInfoManager.getNestedStructure();
+
+  /** ------------------- Event Handlers ------------------- **/
+  const handleUpdateEvent = () => {
+    try {
+      // Patch the event on save
+      const updatedEvent = {
+        summary: eventTitle,
+        extendedProperties: {
+          shared: {
+            "Client": client,
+            "Project": project,
+            "Task": task
+          }
+        }
+      };
+
+      Calendar.Events.patch(updatedEvent, calendarId, eventId);
+
+      return CardService.newActionResponseBuilder()
+        .setNotification(CardService.newNotification()
+          .setText('Event Updated.')
+          .setType(CardService.NotificationType.INFO))
+        .setStateChanged(true)
+        .build();
+    } catch (error) {
+      return CardService.newActionResponseBuilder()
+        .setNotification(CardService.newNotification()
+          .setText(`An error occurred: ${error.message}`)
+          .setType(CardService.NotificationType.ERROR))
+        .build();
+    }
+  };
+
+  /** ------------------- UI Builders ------------------- **/
+  const buildClientProjectTaskSection = () => {
+    const section = CardService.newCardSection();
+
+    // Event title
+    const descriptionInput = CardService.newTextInput()
+      .setFieldName('eventTitle')
+      .setValue(eventTitle || "")
+      .setTitle('Title');
+    section.addWidget(descriptionInput);
+
+    // Clients
+    const clientItems = projectInfoManager.getClients();
+    const clientActionParams = { event: "inputChangeClient", action: "update" };
+    const clientInput = CardService.newSelectionInput()
+      .setType(CardService.SelectionInputType.DROPDOWN)
+      .setFieldName('Client')
+      .setTitle('Client')
+      .setOnChangeAction(
+        CardService.newAction()
+          .setFunctionName('EventCard')
+          .setParameters(clientActionParams)
+      );
+
+    client = client || clientItems[0];
+    clientItems.forEach((clientItem) => {
+      clientInput.addItem(clientItem, clientItem, clientItem === client);
+    });
+    section.addWidget(clientInput);
+
+    // Projects and Tasks if client selected
+    if (client) {
+      const selectedClient = nestedItems[client] || {};
+      const projects = Object.keys(selectedClient);
+
+      if (projects.length > 0) {
+        const projectActionParams = { event: "inputChangeProject", action: "update" };
+        const projectInput = CardService.newSelectionInput()
+          .setType(CardService.SelectionInputType.DROPDOWN)
+          .setTitle('Project')
+          .setFieldName('Project')
+          .setOnChangeAction(
+            CardService.newAction()
+              .setFunctionName('EventCard')
+              .setParameters(projectActionParams)
+          );
+
+        project = project || projects[0];
+
+        projects.forEach((projectItem) => {
+          projectInput.addItem(projectItem, projectItem, projectItem === project);
+        });
+
+        section.addWidget(projectInput);
+
+        const tasks = selectedClient?.[project] ?? [];
+        // If no tasks found, we could default to something or leave empty
+        if (tasks.length > 0) {
+          // If no task selected or it doesn't exist anymore, pick first
+          if (!task || !tasks.find(t => t.task === task)) {
+            task = tasks[0].task;
+          }
+
+          const taskInput = CardService.newSelectionInput()
+            .setType(CardService.SelectionInputType.RADIO_BUTTON)
+            .setTitle('Task')
+            .setFieldName('Task');
+
+          tasks.forEach((taskItemObj) => {
+            const taskItem = taskItemObj.task;
+            taskInput.addItem(taskItem, taskItem, taskItem === task);
+          });
+          section.addWidget(taskInput);
+        } else {
+          section.addWidget(CardService.newTextParagraph().setText("No tasks found for this project."));
+        }
+      } else {
+        section.addWidget(CardService.newTextParagraph().setText("No projects found for this client."));
+      }
+    }
+
+    return section;
+  };
+
+  const buildSaveEventSection = () => {
+    const section = CardService.newCardSection();
+
+    const saveButtonParams = { event: "updateEvent", action: "save" };
+    const updateEventButton = CardService.newTextButton()
+      .setText('Update Event')
+      .setOnClickAction(
+        CardService.newAction()
+          .setFunctionName("EventCard")
+          .setParameters(saveButtonParams)
+      );
+
+    section.addWidget(updateEventButton);
+    return section;
+  };
+
+  /** ------------------- Main Execution ------------------- **/
+  const card = CardService.newCardBuilder()
+    .setHeader(CardService.newCardHeader().setTitle('Update event'));
+
+  card.addSection(buildClientProjectTaskSection());
+  card.addSection(buildSaveEventSection());
+
+  // Handle actions similar to the example:
+  if (action === "save") {
+    return handleUpdateEvent();
+  }
+
+  if (action === "update") {
+    return CardService.newActionResponseBuilder()
+      .setNavigation(CardService.newNavigation().updateCard(card.build()))
+      .build();
+  }
+
+  return card.build();
+};
+/**
+ * @file AdminCard.js
+ * @description Provides an administrative interface card for synchronizing and configuring data 
+ * between Google Calendar events, Google Sheets, and BigQuery.
+ *
+ * State Overview:
+ * - If not initialized (no configuration saved), show the setup form.
+ * - Once initialized, show synchronization and reset options.
+ *
+ * Events:
+ * - 'setup': Initializes configuration.
+ * - 'syncEvents': Synchronizes events from Calendar to BigQuery.
+ * - 'syncProjectData': Synchronizes project data from Sheets to BigQuery.
+ * - 'resetSync': Resets synchronization token for Calendar events.
+ * - 'resetConfig': Resets all configuration, allowing a fresh setup.
+ */
+
+/* global gasConfigManager, gasSyncManager, gasBigQueryManager, gasProjectInfoManager, CardService, console */
+
+/**
+ * Creates and returns an Admin Tools card for a Google Workspace Add-on.
+ *
+ * @param {Object} [options={}] - Configuration options and parameters for the card.
+ * @param {Object} [options.parameters={}] - Parameters containing state and event information.
+ * @param {string} [options.parameters.event] - The current event/action to handle (e.g., 'syncEvents', 'setup').
+ * @param {string} [options.parameters.state] - The current state of the card (e.g., 'initialized').
+ * @param {Object} [options.formInput={}] - User input from the form fields (e.g., PROJECT_ID, DATASET_ID).
+ * @returns {CardService.ActionResponse|CardService.Card} - Returns a card or an action response depending on the event handling.
+ */
+const AdminCard = (options = {}) => {
+  console.log(`AdminCard called with options: ${JSON.stringify(options)}`);
+
+  const {
+    parameters = {},
+    formInput = {}
+  } = options;
+
+  const { event: actionEvent, state: currentState } = parameters;
+  console.log(`AdminCard event: ${actionEvent}, state: ${currentState}`);
+
+  const configManager = gasConfigManager();
+  const config = configManager.getConfiguration();
+
+  let syncManager = null;
+  if (configManager.isInitialized()) {
+    syncManager = gasSyncManager({
+      projectId: config.projectId,
+      datasetId: config.datasetId,
+      tableId: 'time',
+      calendarId: config.calendarId,
+    });
+  } else {
+    console.warn("Configuration is not initialized. SyncManager cannot be created.");
+  }
+
+  /** ------------------- Event Handlers ------------------- **/
+
+  /**
+   * Synchronize Calendar events to BigQuery.
+   */
+  const handleSyncEvents = () => {
+    if (!syncManager) {
+      return errorActionResponse("Unable to synchronize events because configuration is not initialized.");
+    }
+
+    try {
+      syncManager.syncCalendarToBigQuery();
+      return successActionResponse("Events synchronized successfully!");
+    } catch (error) {
+      console.error(`Error synchronizing events: ${error.message}`);
+      return errorActionResponse(`Failed to synchronize events. Error: ${error.message}`);
+    }
+  };
+
+  /**
+   * Synchronize project data from the Google Sheet to BigQuery.
+   */
+  const handleSyncProjectData = () => {
+    if (!configManager.isInitialized()) {
+      return errorActionResponse("Configuration not initialized. Cannot synchronize project data.");
+    }
+
+    try {
+      const bigQueryManager = gasBigQueryManager({
+        projectId: config.projectId,
+        datasetId: config.datasetId,
+        tableId: 'projects'
+      });
+
+      const projectDataManager = gasProjectInfoManager({
+        spreadsheetId: config.spreadsheetId,
+        sheetName: 'Projects',
+        bigQueryManager
+      });
+
+      projectDataManager.syncToBigQuery();
+      return successActionResponse("Project data synchronized successfully!");
+    } catch (error) {
+      console.error(`Error synchronizing project data: ${error.message}`);
+      return errorActionResponse(`Failed to synchronize project data. Error: ${error.message}`);
+    }
+  };
+
+  /**
+   * Resets the synchronization token.
+   * Causes next sync to perform a full synchronization.
+   */
+  const handleResetSync = () => {
+    if (!syncManager) {
+      return errorActionResponse("No sync manager available. Ensure configuration is initialized before resetting sync.");
+    }
+
+    try {
+      syncManager.resetSyncToken();
+      return successActionResponse("Synchronization reset successfully! A full sync will occur next time.");
+    } catch (error) {
+      console.error(`Error resetting synchronization: ${error.message}`);
+      return errorActionResponse(`Failed to reset synchronization. Error: ${error.message}`);
+    }
+  };
+
+  /**
+   * Resets the configuration settings.
+   * Allows re-running the setup process.
+   */
+  const handleResetConfig = () => {
+    try {
+      configManager.resetConfiguration();
+      return CardService.newActionResponseBuilder()
+        .setNotification(CardService.newNotification().setText('Configuration reset successfully!'))
+        .setNavigation(
+          CardService.newNavigation().updateCard(
+            AdminCard({ parameters: { state: null, event: null } })
+          )
+        )
+        .build();
+    } catch (error) {
+      console.error(`Error resetting configuration: ${error.message}`);
+      return errorActionResponse(`Failed to reset configuration. Error: ${error.message}`);
+    }
+  };
+
+  /**
+   * Handles initial setup of configuration settings.
+   */
+  const handleSetup = () => {
+    const projectIdInput = formInput.PROJECT_ID && formInput.PROJECT_ID.trim();
+    const datasetIdInput = (formInput.DATASET_ID && formInput.DATASET_ID.trim()) || 'ara_time';
+    const calendarNameInput = (formInput.CALENDAR_NAME && formInput.CALENDAR_NAME.trim()) || 'ara time';
+
+    if (!projectIdInput) {
+      return errorActionResponse("Project ID is required to complete setup. Please provide a valid Project ID.");
+    }
+
+    const { success, messages } = configManager.configureApp({
+      projectId: projectIdInput,
+      datasetId: datasetIdInput,
+      calendarName: calendarNameInput
+    });
+
+    const notificationText = success
+      ? 'Setup completed successfully!'
+      : `Setup failed:\n${messages.join('\n')}`;
+
+    if (success) {
+      console.log('Configuration setup completed successfully!');
+      const updatedParams = { ...parameters, state: 'initialized', event: null };
+      return CardService.newActionResponseBuilder()
+        .setNotification(CardService.newNotification().setText(notificationText))
+        .setNavigation(
+          CardService.newNavigation().updateCard(AdminCard({ parameters: updatedParams }))
+        )
+        .build();
+    }
+
+    console.error('Configuration setup failed.');
+    return errorActionResponse(notificationText);
+  };
+
+  /** ------------------- UI Builders ------------------- **/
+
+  /**
+   * Builds the main Admin UI card based on current state.
+   */
+  const buildAdminUiCard = () => {
+    const card = CardService.newCardBuilder()
+      .setHeader(
+        CardService.newCardHeader()
+          .setTitle('Admin Tools')
+          .setSubtitle('Manage backend data synchronization and configuration')
+          .setImageUrl('https://duizendstra.com/images/arabellix_time_icon.png')
+          .setImageStyle(CardService.ImageStyle.CIRCLE)
+      );
+
+    if (!configManager.isInitialized()) {
+      card.addSection(buildInitializationSection());
+    } else {
+      card.addSection(buildSynchronizationSection());
+      card.addSection(buildResetSection());
+    }
+
+    return card.build();
+  };
+
+  /**
+   * Builds the initialization (setup) section.
+   */
+  const buildInitializationSection = () => {
+    const section = CardService.newCardSection().setHeader('App Setup');
+
+    const projectIdInput = CardService.newTextInput()
+      .setFieldName('PROJECT_ID')
+      .setValue(formInput.PROJECT_ID || '')
+      .setTitle('BigQuery Project ID')
+      .setHint('Required: Your Google Cloud Project ID');
+
+    const datasetIdInput = CardService.newTextInput()
+      .setFieldName('DATASET_ID')
+      .setValue(formInput.DATASET_ID || 'ara_time')
+      .setTitle('BigQuery Dataset ID')
+      .setHint('Default: "ara_time"');
+
+    const calendarNameInput = CardService.newTextInput()
+      .setFieldName('CALENDAR_NAME')
+      .setValue(formInput.CALENDAR_NAME || 'ara time')
+      .setTitle('Calendar Name')
+      .setHint('Default: "ara time"');
+
+    const setupButton = CardService.newTextButton()
+      .setText('Setup')
+      .setTextButtonStyle(CardService.TextButtonStyle.OUTLINED)
+      .setOnClickAction(
+        CardService.newAction()
+          .setFunctionName('AdminCard')
+          .setParameters({ event: 'setup' })
+      );
+
+    section.addWidget(projectIdInput);
+    section.addWidget(datasetIdInput);
+    section.addWidget(calendarNameInput);
+    section.addWidget(setupButton);
+
+    return section;
+  };
+
+  /**
+   * Builds the synchronization section, shown when initialized.
+   */
+  const buildSynchronizationSection = () => {
+    const section = CardService.newCardSection().setHeader('Synchronization');
+
+    section.addWidget(
+      CardService.newTextParagraph().setText(
+        'Use these options to synchronize your data:\n' +
+        '- Calendar events: Pull events from Google Calendar into BigQuery.\n' +
+        '- Projects sheet: Pull project data from Google Sheets into BigQuery.'
+      )
+    );
+
+    section.addWidget(
+      CardService.newTextButton()
+        .setText('Calendar events')
+        .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+        .setOnClickAction(
+          CardService.newAction()
+            .setFunctionName('AdminCard')
+            .setParameters({ event: 'syncEvents' })
+        )
+    );
+
+    section.addWidget(
+      CardService.newTextButton()
+        .setText('Projects sheet')
+        .setTextButtonStyle(CardService.TextButtonStyle.OUTLINED)
+        .setOnClickAction(
+          CardService.newAction()
+            .setFunctionName('AdminCard')
+            .setParameters({ event: 'syncProjectData' })
+        )
+    );
+
+    return section;
+  };
+
+  /**
+   * Builds the reset section, shown when initialized.
+   */
+  const buildResetSection = () => {
+    const section = CardService.newCardSection().setHeader('Reset');
+
+    section.addWidget(
+      CardService.newTextParagraph().setText(
+        'Reset Actions:\n' +
+        '- Reset Synchronization: Clears the sync token, causing a full sync next time.\n' +
+        '- Reset Configuration: Allows re-running setup. Existing dataset/tables remain. A new spreadsheet and calendar may be created if needed.'
+      )
+    );
+
+    section.addWidget(
+      CardService.newTextButton()
+        .setText('Reset synchronization')
+        .setTextButtonStyle(CardService.TextButtonStyle.OUTLINED)
+        .setOnClickAction(
+          CardService.newAction()
+            .setFunctionName('AdminCard')
+            .setParameters({ event: 'resetSync' })
+        )
+    );
+
+    section.addWidget(
+      CardService.newTextButton()
+        .setText('Reset configuration')
+        .setTextButtonStyle(CardService.TextButtonStyle.OUTLINED)
+        .setOnClickAction(
+          CardService.newAction()
+            .setFunctionName('AdminCard')
+            .setParameters({ event: 'resetConfig' })
+        )
+    );
+
+    return section;
+  };
+
+  /** ------------------- Utility Functions ------------------- **/
+
+  /**
+   * Returns a success ActionResponse that also updates the card.
+   * @param {string} message
+   */
+  const successActionResponse = (message) => {
+    return CardService.newActionResponseBuilder()
+      .setNotification(CardService.newNotification().setText(message))
+      .setNavigation(
+        CardService.newNavigation().updateCard(
+          AdminCard({ ...options, parameters: { state: currentState, event: null } })
+        )
+      )
+      .build();
+  };
+
+  /**
+   * Returns an error ActionResponse with a notification.
+   * Does not update the card to avoid losing the current state/input.
+   * @param {string} errorMsg
+   */
+  const errorActionResponse = (errorMsg) => {
+    return CardService.newActionResponseBuilder()
+      .setNotification(
+        CardService.newNotification()
+          .setText(errorMsg)
+      )
+      .build();
+  };
+
+  /** ------------------- Main Execution ------------------- **/
+
+  const eventHandlers = {
+    syncEvents: handleSyncEvents,
+    syncProjectData: handleSyncProjectData,
+    resetSync: handleResetSync,
+    resetConfig: handleResetConfig,
+    setup: handleSetup,
+  };
+
+  // If there's an event, handle it. Otherwise, return the default UI.
+  return (actionEvent && eventHandlers[actionEvent])
+    ? eventHandlers[actionEvent]()
+    : buildAdminUiCard();
+};
+/**
+ * @file StateCard.js
+ * @description A reference and demonstration card for testing Google Workspace Add-on state and event handling.
+ * This `StateCard` showcases:
+ * - A state-driven process flow.
+ * - Responding to events that update the state.
+ * - Best practices and patterns for building Google Workspace Add-on cards, as learned from the AdminCard example.
+ *
+ * Unlike more complex cards, `StateCard` is simplified and focused on teaching how to:
+ * - Initialize and modify state.
+ * - Use events to progress through a series of steps.
+ * - Render the card UI differently based on the current state.
+ *
+ * The logic here can be adapted or extended for more complex use cases.
+ */
+
+/* global CardService, console */
+
+/**
+ * Creates and returns a `StateCard` for a Google Workspace Add-on.
+ * This card demonstrates handling a state-driven process and using events to update that state.
+ *
+ * Process flow:
+ * 1. Initial State (no state or "completed"):
+ *    - Shows a "Start Process" button.
+ * 2. On "startProcess" event (if not already in progress):
+ *    - Updates state to "in_progress".
+ * 3. When state is "in_progress":
+ *    - Simulates the process completing.
+ *    - After completion, updates state to "completed".
+ * 4. When state is "completed":
+ *    - Displays a message indicating completion.
+ *    - Offers the user a chance to restart the process.
+ *
+ * @param {Object} [options={}] - Parameters passed into the card.
+ * @param {Object} [options.parameters={}] - Contains event and state information for the card.
+ * @param {string} [options.parameters.event] - The current event/action to handle (e.g., 'startProcess').
+ * @param {string} [options.parameters.state] - The current state of the card (e.g., 'in_progress', 'completed').
+ * @returns {CardService.ActionResponse|CardService.Card} - Returns a card or an action response depending on the event handling.
+ *
+ * @example
+ * const card = StateCard({
+ *   parameters: { event: 'startProcess', state: null }
+ * });
+ * // This would initiate the process and return an action response that updates the card.
+ */
+const StateCard = (options = {}) => {
+  const { parameters = {} } = options;
+  const { event: currentEvent, state: currentState } = parameters;
+
+  console.log(`StateCard called with event: ${currentEvent}, state: ${currentState}`);
+
+  // Define helper functions first to ensure clarity and maintainability.
+
+  /**
+   * Handles the "startProcess" event. If the process is not already in progress,
+   * it updates the state to "in_progress" and triggers an update to the card.
+   *
+   * @returns {CardService.ActionResponse} - An action response that updates the card to the "in_progress" state.
+   */
+  const handleStartProcess = () => {
+    if (currentState !== 'in_progress') {
+      const updatedParams = { ...parameters, state: 'in_progress' };
+      console.log('Process started, updating state to in_progress.');
+
+      return CardService.newActionResponseBuilder()
+        .setNavigation(
+          CardService.newNavigation().updateCard(StateCard({ parameters: updatedParams }))
+        )
+        .build();
+    }
+
+    // If we are already in progress, just build the card as is.
+    return buildUiCard(currentState);
+  };
+
+  /**
+   * Simulates completing the process if the state is currently "in_progress".
+   * When completed, it updates the state to "completed" and shows a notification.
+   *
+   * @returns {CardService.ActionResponse} - An action response that notifies and updates the card to "completed".
+   */
+  const completeProcessIfInProgress = () => {
+    if (currentState === 'in_progress') {
+      const updatedParams = { ...parameters, state: 'completed' };
+      console.log('Process completed, updating state to completed.');
+
+      return CardService.newActionResponseBuilder()
+        .setNotification(
+          CardService.newNotification()
+            .setText('Process completed successfully!')
+            .setType(CardService.NotificationType.INFO)
+        )
+        .setNavigation(CardService.newNavigation().updateCard(StateCard({ parameters: updatedParams })))
+        .build();
+    }
+
+    // If not in progress, just build the card as is.
+    return buildUiCard(currentState);
+  };
+
+  /**
+   * Builds the main UI card based on the current state.
+   * - No state or "completed": shows a "Start Process" button.
+   * - "in_progress": shows a message that the process is running.
+   * - "completed": shows a message that the process has finished and can be restarted.
+   *
+   * @param {string} state - The current state of the process.
+   * @returns {CardService.Card} - The constructed state card.
+   */
+  const buildUiCard = (state) => {
+    const card = CardService.newCardBuilder()
+      .setHeader(CardService.newCardHeader().setTitle('StateCard Test'));
+
+    const section = CardService.newCardSection()
+      .addWidget(
+        CardService.newTextParagraph().setText('This card demonstrates state and event handling.')
+      );
+
+    if (!state || state === 'completed') {
+      // State is either not set or the process completed:
+      // Offer a button to start the process again.
+      section.addWidget(
+        CardService.newTextButton()
+          .setText('Start Process')
+          .setOnClickAction(
+            CardService.newAction()
+              .setFunctionName('StateCard')
+              .setParameters({ event: 'startProcess' })
+          )
+      );
+    } else if (state === 'in_progress') {
+      // State is "in_progress":
+      // Show a message that the process is running.
+      // In a real-world scenario, you might trigger a follow-up event or time-based action.
+      section.addWidget(
+        CardService.newTextParagraph().setText('Process is in progress. Please wait...')
+      );
+    }
+
+    card.addSection(section);
+    return card.build();
+  };
+
+  // Event handling:
+  // Based on what we learned, it's cleaner to handle events first, then fall back to building the UI.
+  if (currentEvent === 'startProcess') {
+    // If starting the process and not in progress, handle that scenario.
+    return handleStartProcess();
+  }
+
+  if (currentState === 'in_progress') {
+    // If we're in progress, simulate completing the process.
+    return completeProcessIfInProgress();
+  }
+
+  // If no event triggered or the process is completed, just build the UI card as is.
+  return buildUiCard(currentState);
+};
+/**
+ * @file HomepageCard.js
+ * @description Provides the primary UI for creating new calendar events. 
+ * Allows the user to select date, client, project, task, and then create an event.
+ * If the app is not initialized, redirects the user to the AdminCard.
+ */
+
+/* global gasConfigManager, gasProjectInfoManager, gasBigQueryManager, gasCalendarManager, CardService, console, AdminCard */
+
+const HomepageCard = (options = {}) => {
+  console.log(`HomepageCard called with options: ${JSON.stringify(options)}`);
+
+  const {
+    parameters = {},
+    formInput = {}
+  } = options;
+
+  const { event: actionEvent, code: paramCode = "", rate: paramRate = "" } = parameters;
+
+  // Initialize configuration and check if app is ready
+  const configManager = gasConfigManager();
+  if (!configManager.isInitialized()) {
+    console.log("App not initialized. Redirecting to AdminCard.");
+    return AdminCard(options);
+  }
+
+  const { projectId, datasetId, spreadsheetId, calendarId } = configManager.getConfiguration();
+  const projectInfoManager = gasProjectInfoManager({
+    spreadsheetId,
+    bigQueryManager: gasBigQueryManager({ projectId, datasetId, tableId: "projects" })
+  });
+
+  /** ------------------- State and Data Extraction ------------------- **/
+  const eventTitle = formInput.eventTitle || "";
+  const eventDescription = formInput.eventDescription || "";
+  let client = formInput.Client;
+  let project = formInput.Project;
+  let task = formInput.Task;
+  let taskDetails = { description: '', code: '', rate: '', comments: '', categories: '' };
+
+  const nestedItems = projectInfoManager.getActiveProjectsTree();
+  const companySize = formInput.companySize || taskDetails.companySize || "";
+
+  /** ------------------- Event Handlers ------------------- **/
+  const handleCreateEvent = () => {
+    try {
+      if (!calendarId) {
+        throw new Error("No calendarId configured. Please run setup in AdminCard.");
+      }
+
+      const msSinceEpoch = formInput.eventDate && formInput.eventDate.msSinceEpoch
+        ? parseInt(formInput.eventDate.msSinceEpoch, 10)
+        : Date.now();
+      const eventDate = new Date(msSinceEpoch);
+
+      const now = new Date();
+      const roundedStart = new Date(
+        eventDate.getFullYear(),
+        eventDate.getMonth(),
+        eventDate.getDate(),
+        now.getHours(),
+        0, 0, 0
+      );
+      const oneHourLater = new Date(roundedStart.getTime() + 60 * 60 * 1000);
+
+      const calendarManager = gasCalendarManager({ calendarId });
+
+      const code = paramCode || "";
+      const rate = paramRate || "";
+      const comments = taskDetails.comments || "";
+      const categoriesArray = taskDetails.categories ? [taskDetails.categories] : [];
+
+      const newEventId = calendarManager.createEvent({
+        title: eventDescription || "Untitled Event",
+        startTime: roundedStart,
+        endTime: oneHourLater,
+        description: "",
+        location: "",
+        client,
+        project,
+        task,
+        code,
+        rate,
+        comments,
+        companySize,
+        categories: categoriesArray,
+        originalTitle: eventTitle
+      });
+
+      console.log(`Event created with ID: ${newEventId}`);
+      return CardService.newActionResponseBuilder()
+        .setNotification(CardService.newNotification().setText("Event created successfully!"))
+        .build();
+    } catch (error) {
+      console.error(`Error creating event: ${error.message}`);
+      return CardService.newActionResponseBuilder()
+        .setNotification(CardService.newNotification().setText(`Failed to create event: ${error.message}`))
+        .build();
+    }
+  };
+
+  // Additional handlers for input changes could go here if needed.
+  // Example: handleInputChangeClient, handleInputChangeProject, handleInputChangeTask
+
+  /** ------------------- UI Builder Functions ------------------- **/
+  const buildUiCard = () => {
+    const card = CardService.newCardBuilder()
+      .setHeader(
+        CardService.newCardHeader()
+          .setTitle("New event")
+          .setSubtitle("Manage your impact efficiently")
+          .setImageUrl("https://duizendstra.com/images/arabellix_time_icon.png")
+          .setImageStyle(CardService.ImageStyle.CIRCLE)
+      );
+
+    card.addSection(buildEventBasicsSection());
+    card.addSection(buildWorkDetailsSection());
+
+    if (task) {
+      card.addSection(buildTaskDetailsSection());
+    }
+
+    card.addSection(buildEventActionsSection());
+
+    return card.build();
+  };
+
+  const buildEventBasicsSection = () => {
+    const section = CardService.newCardSection().setHeader('Event Basics');
+
+    const dateInput = CardService.newDatePicker()
+      .setFieldName('eventDate')
+      .setTitle('Event Date')
+      .setValueInMsSinceEpoch(new Date().getTime());
+    section.addWidget(dateInput);
+
+    const descriptionInput = CardService.newTextInput()
+      .setFieldName('eventDescription')
+      .setTitle('Description (This will become the Event Summary)')
+      .setValue(eventDescription);
+    section.addWidget(descriptionInput);
+
+    const clientItems = projectInfoManager.getActiveClients();
+    if (clientItems.length > 0 && !client) {
+      client = clientItems[0];
+    }
+
+    const clientInput = CardService.newSelectionInput()
+      .setType(CardService.SelectionInputType.DROPDOWN)
+      .setFieldName('Client')
+      .setTitle('Client')
+      .setOnChangeAction(
+        CardService.newAction()
+          .setFunctionName('HomepageCard')
+          .setParameters({ event: "inputChangeClient" })
+      );
+
+    clientItems.forEach((clientItem) => {
+      clientInput.addItem(clientItem, clientItem, clientItem === client);
+    });
+    section.addWidget(clientInput);
+
+    if (clientItems.length === 0) {
+      section.addWidget(
+        CardService.newTextParagraph().setText("No active clients available. Please verify project data.")
+      );
+    }
+
+    return section;
+  };
+
+  const buildWorkDetailsSection = () => {
+    const section = CardService.newCardSection().setHeader('Work Details');
+
+    if (client) {
+      const selectedClient = nestedItems[client] || {};
+      const projects = Object.keys(selectedClient);
+      if (projects.length > 0) {
+        project = project || projects[0];
+
+        const projectInput = CardService.newSelectionInput()
+          .setType(CardService.SelectionInputType.RADIO_BUTTON)
+          .setTitle('Project')
+          .setFieldName('Project')
+          .setOnChangeAction(
+            CardService.newAction()
+              .setFunctionName('HomepageCard')
+              .setParameters({ event: "inputChangeProject" })
+          );
+
+        projects.forEach((projectItem) => {
+          projectInput.addItem(projectItem, projectItem, projectItem === project);
+        });
+        section.addWidget(projectInput);
+
+        const tasks = selectedClient[project] || [];
+        if (tasks.length > 0) {
+          if (task && !tasks.find(t => t.task === task)) {
+            task = null;
+          }
+
+          const taskInput = CardService.newSelectionInput()
+            .setType(CardService.SelectionInputType.RADIO_BUTTON)
+            .setTitle('Task')
+            .setFieldName('Task')
+            .setOnChangeAction(
+              CardService.newAction()
+                .setFunctionName('HomepageCard')
+                .setParameters({ event: "inputChangeTask" })
+            );
+
+          tasks.forEach((t) => {
+            taskInput.addItem(t.task, t.task, t.task === task);
+          });
+          section.addWidget(taskInput);
+
+          if (task) {
+            const selectedTask = tasks.find(t => t.task === task);
+            if (selectedTask) {
+              taskDetails = selectedTask;
+            }
+          }
+        } else {
+          section.addWidget(CardService.newTextParagraph().setText("No tasks found for this project."));
+        }
+      } else {
+        section.addWidget(CardService.newTextParagraph().setText("No projects found for this client."));
+      }
+    } else {
+      section.addWidget(CardService.newTextParagraph().setText("Select a client to view projects."));
+    }
+
+    return section;
+  };
+
+  const buildTaskDetailsSection = () => {
+    const section = CardService.newCardSection().setHeader('Task Details');
+
+    section.addWidget(
+      CardService.newDecoratedText()
+        .setTopLabel("Rate")
+        .setText(taskDetails.rate || "N/A")
+    );
+
+    section.addWidget(
+      CardService.newDecoratedText()
+        .setTopLabel("Comments")
+        .setText(taskDetails.comments || "N/A")
+    );
+
+    section.addWidget(
+      CardService.newDecoratedText()
+        .setTopLabel("Categories")
+        .setText(taskDetails.categories || "N/A")
+    );
+
+    return section;
+  };
+
+  const buildEventActionsSection = () => {
+    const section = CardService.newCardSection().setHeader('Event Actions');
+
+    const isButtonEnabled = !!(client && project && task);
+
+    const newEventSaveButton = CardService.newTextButton()
+      .setText('Create Event')
+      .setTextButtonStyle(CardService.TextButtonStyle.FILLED)
+      .setDisabled(!isButtonEnabled)
+      .setOnClickAction(
+        CardService.newAction()
+          .setFunctionName("HomepageCard")
+          .setParameters({
+            event: "newEventSaveButton",
+            code: taskDetails.code || ""
+          })
+      );
+
+    if (!isButtonEnabled) {
+      section.addWidget(
+        CardService.newTextParagraph().setText(
+          "Select client, project, and task to enable event creation."
+        )
+      );
+    }
+
+    section.addWidget(newEventSaveButton);
+    return section;
+  };
+
+  /** ------------------- Dispatch Events or Build Card ------------------- **/
+  const eventHandlers = {
+    newEventSaveButton: handleCreateEvent
+    // Additional handlers can be added here if needed.
+  };
+
+  return actionEvent && eventHandlers[actionEvent]
+    ? eventHandlers[actionEvent]()
+    : buildUiCard();
+};
+
+     ```
+
+   This example shows:
+   - How to structure a single card-rendering function.
+   - How to handle events (passed in through `parameters`) and update the card view accordingly.
+   - How to use helper functions for clarity and maintainability.
+
+2. **Manager Pattern:**
+   - Reference a generic manager pattern similar to `gasConfigManager`:
+     ```js
+     /**
+      * The `exampleManager` is a generic manager that:
+      * - Provides initialization checks.
+      * - Saves and retrieves configuration from `PropertiesService`.
+      * - Uses arrow functions and `const` for modern JS syntax.
+      * 
+      * Example usage:
+      * const mgr = exampleManager({ defaultKey: 'defaultVal' });
+      * if (!mgr.isInitialized()) {
+      *   mgr.initialize({ key: 'value' });
+      * }
+      * const config = mgr.getConfiguration();
+      */
+     const exampleManager = (params = {}) => {
+       const { defaultKey = 'defaultVal' } = params;
+       const INIT_FLAG = 'EXAMPLE_INIT';
+
+       const isInitialized = () => {
+         const props = PropertiesService.getUserProperties();
+         return props.getProperty(INIT_FLAG) === 'true';
+       };
+
+       const initialize = (config = {}) => {
+         const { key } = config;
+         if (!key) throw new Error('Key is required for initialization');
+
+         const props = PropertiesService.getUserProperties();
+         props.setProperty('KEY', key);
+         props.setProperty(INIT_FLAG, 'true');
+       };
+
+       const getConfiguration = () => {
+         const props = PropertiesService.getUserProperties();
+         const key = props.getProperty('KEY') || defaultKey;
+         return { key };
+       };
+
+       const reset = () => {
+         const props = PropertiesService.getUserProperties();
+         props.deleteProperty('KEY');
+         props.deleteProperty(INIT_FLAG);
+       };
+
+       return Object.freeze({
+         isInitialized,
+         initialize,
+         getConfiguration,
+         reset
+       });
+     };
+     ```
+
+**Instructions for You:**
+
+- When asked to create new cards, follow the `StateCard` pattern:
+  - Define a single function that takes an `options` object.
+  - Extract `parameters` from `options`.
+  - Implement event handling logic first.
+  - Build the UI with clear helper functions that return card sections.
+  - Return either a `CardService.ActionResponse` or a `CardService.Card`.
+
+- When asked to create new managers, follow the `exampleManager` pattern:
+  - Accept parameters as an object.
+  - Use `PropertiesService` for persistence.
+  - Provide `isInitialized`, `initialize`, `getConfiguration`, and `reset` methods as appropriate.
+  - Use `const`, arrow functions, and object destructuring to adhere to modern JavaScript style.
+
+- Use these patterns as templates for all future code requests involving card creation and manager logic in Google Apps Script.
